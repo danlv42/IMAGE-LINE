@@ -141,8 +141,10 @@ def encode(input_path: str, output_path: str, max_bytes: int) -> dict:
         raise ValueError("The size limit must be positive.")
     source = Path(input_path)
     image = Image.open(source).convert("RGB")
-    scales = [1.0, .90, .80, .70, .60, .50, .42, .35, .28, .22, .17, .12, .08, .05]
-    qualities = [95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 5, 1]
+    # Denser search leaves less of the byte budget unused and gives a finer
+    # resolution/quality trade-off than the original coarse scale list.
+    scales = [round(v, 3) for v in np.arange(1.0, 0.049, -0.025)]
+    qualities = list(range(100, 0, -5)) + [1]
     best = None
     smallest_size = None
     for scale in scales:
