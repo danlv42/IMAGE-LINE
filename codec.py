@@ -45,6 +45,17 @@ ZIGZAG = [
     (7,5),(6,6),(5,7),(6,7),(7,6),(7,7)
 ]
 ZIGZAG_FLAT = np.array([r * 8 + c for r, c in ZIGZAG], dtype=np.intp)
+# Keep the original 62-entry scan so files created by the first buggy MVP remain readable.
+LEGACY_ZIGZAG_FLAT = ZIGZAG_FLAT.copy()
+# Complete 64-position zigzag scan for new LSC2 files.
+_full_zigzag = []
+for _diagonal in range(15):
+    _lo, _hi = max(0, _diagonal - 7), min(7, _diagonal)
+    _rows = range(_hi, _lo - 1, -1) if _diagonal % 2 == 0 else range(_lo, _hi + 1)
+    for _row in _rows:
+        _full_zigzag.append((_row, _diagonal - _row))
+ZIGZAG = _full_zigzag
+ZIGZAG_FLAT = np.array([r * 8 + c for r, c in ZIGZAG], dtype=np.intp)
 # Orthonormal DCT-II basis.
 _C = np.empty((8, 8), dtype=np.float32)
 for _u in range(8):
@@ -78,7 +89,19 @@ def _dct_quantize(channel: np.ndarray, table: np.ndarray) -> tuple[np.ndarray, i
 
 
 def _idct_dequantize(stream: np.ndarray, hp: int, wp: int, table: np.ndarray) -> np.ndarray:
-    q = stream.astype(np.float32).reshape(-1, 64)[:, np.argsort(ZIGZAG_FLAT)].reshape(-1, 8, 8)
+    stream = np.asarray(stream)
+    if stream.ndim != 2:
+        raise ValueError("Coefficient stream must be a 2D block array.")
+    if stream.shape[1] == 62:
+        # Backward compatibility for .lsc files created by the initial MVP,
+        # whose zigzag table accidentally omitted two coefficients per block.
+        q_flat = np.zeros((stream.shape[0], 64), dtype=np.float32)
+        q_flat[:, LEGACY_ZIGZAG_FLAT] = stream.astype(np.float32)
+    elif stream.shape[1] == 64:
+        q_flat = stream.astype(np.float32)[:, np.argsort(ZIGZAG_FLAT)]
+    else:
+        raise ValueError(f"Invalid coefficient count per block: {stream.shape[1]}")
+    q = q_flat.reshape(-1, 8, 8)
     coeff = q * table[None, :, :]
     blocks = np.einsum("ji,bjk,kl->bil", _C, coeff, _C, optimize=True) + 128.0
     rows = blocks.reshape(hp // 8, wp // 8, 8, 8).transpose(0, 2, 1, 3)
@@ -161,13 +184,21 @@ def decode(input_path: str, output_path: str) -> dict:
     if len(raw) != expected_bytes:
         raise ValueError("Coefficient data size does not match the header.")
     coeff = np.frombuffer(raw, dtype=">i2")
-    yq = coeff[:y_count].reshape(-1, 64)
-    cbq = coeff[y_count:y_count + c_count].reshape(-1, 64)
-    crq = coeff[y_count + c_count:].reshape(-1, 64)
     quality = int(header["quality"])
     ty, tc = _quant_table(QY, quality), _quant_table(QC, quality)
     yhp, ywp = map(int, header["y_padded"])
     chp, cwp = map(int, header["c_padded"])
+    y_blocks = (yhp // 8) * (ywp // 8)
+    c_blocks = (chp // 8) * (cwp // 8)
+    if y_count == y_blocks * 64 and c_count == c_blocks * 64:
+        coefficients_per_block = 64
+    elif y_count == y_blocks * 62 and c_count == c_blocks * 62:
+        coefficients_per_block = 62
+    else:
+        raise ValueError("Coefficient counts do not match padded image dimensions.")
+    yq = coeff[:y_count].reshape(y_blocks, coefficients_per_block)
+    cbq = coeff[y_count:y_count + c_count].reshape(c_blocks, coefficients_per_block)
+    crq = coeff[y_count + c_count:].reshape(c_blocks, coefficients_per_block)
     y = _idct_dequantize(yq, yhp, ywp, ty)[:int(header["height"]), :int(header["width"])]
     cw, ch = max(1, (int(header["width"]) + 1) // 2), max(1, (int(header["height"]) + 1) // 2)
     cb = _idct_dequantize(cbq, chp, cwp, tc)[:ch, :cw]
