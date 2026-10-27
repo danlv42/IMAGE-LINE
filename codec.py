@@ -122,7 +122,7 @@ def _encode_candidate(image: Image.Image, scale: float, quality: int) -> bytes:
     cbq, chp, cwp = _dct_quantize(cb_small, tc)
     crq, _, _ = _dct_quantize(cr_small, tc)
     raw = yq.tobytes() + cbq.tobytes() + crq.tobytes()
-    compressed = zlib.compress(raw, level=9)
+    compressed = zlib.compress(raw, level=6)
     header = {
         "version": VERSION, "width": w, "height": h,
         "original_width": image.width, "original_height": image.height,
