@@ -1,5 +1,5 @@
 """
-IMAGE-LINE LSC v2: custom block-transform lossy image codec.
+IMAGE-LINE LSC v2: custom block-transform lossy image codec (cached-transform encoder).
 Pipeline: RGB -> YCbCr -> 4:2:0 chroma subsampling -> 8x8 DCT ->
 custom quantization -> zlib-compressed coefficient arrays.
 This is an educational custom format, not JPEG/WebP/AVIF.
@@ -80,12 +80,24 @@ def _blocks(channel: np.ndarray) -> tuple[np.ndarray, int, int]:
     return blocks.reshape(-1, 8, 8), hp, wp
 
 
-def _dct_quantize(channel: np.ndarray, table: np.ndarray) -> tuple[np.ndarray, int, int]:
+def _dct_coefficients(channel: np.ndarray) -> tuple[np.ndarray, int, int]:
+    """Transform one channel once; keep coefficients in zigzag order for reuse."""
     blocks, hp, wp = _blocks(channel.astype(np.float32) - 128.0)
     coeff = np.einsum("ij,bjk,lk->bil", _C, blocks, _C, optimize=True)
-    q = np.rint(coeff / table[None, :, :]).astype(np.int16)
-    # Zigzag per block tends to put long zero runs at the end, improving zlib.
-    return q.reshape(-1, 64)[:, ZIGZAG_FLAT].astype(">i2"), hp, wp
+    zigzag_coeff = coeff.reshape(-1, 64)[:, ZIGZAG_FLAT]
+    return zigzag_coeff.astype(np.float32), hp, wp
+
+
+def _quantize_coefficients(coeff: np.ndarray, table: np.ndarray) -> np.ndarray:
+    """Quantize cached zigzag DCT coefficients without repeating the DCT."""
+    table_flat = table.reshape(64)[ZIGZAG_FLAT]
+    return np.rint(coeff / table_flat[None, :]).astype(">i2")
+
+
+def _dct_quantize(channel: np.ndarray, table: np.ndarray) -> tuple[np.ndarray, int, int]:
+    # Compatibility helper retained for internal callers and tests.
+    coeff, hp, wp = _dct_coefficients(channel)
+    return _quantize_coefficients(coeff, table), hp, wp
 
 
 def _idct_dequantize(stream: np.ndarray, hp: int, wp: int, table: np.ndarray) -> np.ndarray:
@@ -108,32 +120,60 @@ def _idct_dequantize(stream: np.ndarray, hp: int, wp: int, table: np.ndarray) ->
     return np.clip(rows.reshape(hp, wp), 0, 255)
 
 
-def _encode_candidate(image: Image.Image, scale: float, quality: int) -> bytes:
+def _prepare_scale(image: Image.Image, scale: float) -> dict:
+    """Resize, subsample and transform channels once for all quality trials."""
     w = max(1, round(image.width * scale))
     h = max(1, round(image.height * scale))
     scaled = image.resize((w, h), Image.Resampling.LANCZOS).convert("YCbCr")
     y, cb, cr = [np.asarray(ch, dtype=np.uint8) for ch in scaled.split()]
-    # 4:2:0 chroma subsampling: human vision is less sensitive to fine color detail.
+
+    # 4:2:0 chroma subsampling: vision is less sensitive to fine color detail.
     cw, ch = max(1, (w + 1) // 2), max(1, (h + 1) // 2)
-    cb_small = np.asarray(Image.fromarray(cb).resize((cw, ch), Image.Resampling.BOX), dtype=np.uint8)
-    cr_small = np.asarray(Image.fromarray(cr).resize((cw, ch), Image.Resampling.BOX), dtype=np.uint8)
+    cb_small = np.asarray(
+        Image.fromarray(cb).resize((cw, ch), Image.Resampling.BOX), dtype=np.uint8
+    )
+    cr_small = np.asarray(
+        Image.fromarray(cr).resize((cw, ch), Image.Resampling.BOX), dtype=np.uint8
+    )
+
+    y_coeff, yhp, ywp = _dct_coefficients(y)
+    cb_coeff, chp, cwp = _dct_coefficients(cb_small)
+    cr_coeff, _, _ = _dct_coefficients(cr_small)
+    return {
+        "width": w, "height": h,
+        "y_coeff": y_coeff, "cb_coeff": cb_coeff, "cr_coeff": cr_coeff,
+        "y_padded": [yhp, ywp], "c_padded": [chp, cwp],
+        "original_width": image.width, "original_height": image.height,
+        "scale": float(scale),
+    }
+
+
+def _pack_prepared(prepared: dict, quality: int) -> bytes:
+    """Quantize and entropy-compress one prepared scale at a selected quality."""
     ty, tc = _quant_table(QY, quality), _quant_table(QC, quality)
-    yq, yhp, ywp = _dct_quantize(y, ty)
-    cbq, chp, cwp = _dct_quantize(cb_small, tc)
-    crq, _, _ = _dct_quantize(cr_small, tc)
+    yq = _quantize_coefficients(prepared["y_coeff"], ty)
+    cbq = _quantize_coefficients(prepared["cb_coeff"], tc)
+    crq = _quantize_coefficients(prepared["cr_coeff"], tc)
+
     raw = yq.tobytes() + cbq.tobytes() + crq.tobytes()
     compressed = zlib.compress(raw, level=6)
     header = {
-        "version": VERSION, "width": w, "height": h,
-        "original_width": image.width, "original_height": image.height,
-        "quality": int(quality), "scale": float(scale),
-        "y_padded": [yhp, ywp], "c_padded": [chp, cwp],
+        "version": VERSION, "width": prepared["width"], "height": prepared["height"],
+        "original_width": prepared["original_width"],
+        "original_height": prepared["original_height"],
+        "quality": int(quality), "scale": prepared["scale"],
+        "y_padded": prepared["y_padded"], "c_padded": prepared["c_padded"],
         "y_coeff_count": int(yq.size), "c_coeff_count": int(cbq.size),
         "chroma": "4:2:0", "transform": "8x8 DCT-II",
         "quantization": "custom scalar tables", "payload": "zlib int16 zigzag"
     }
     hb = json.dumps(header, separators=(",", ":")).encode("utf-8")
     return MAGIC + HEADER_LEN.pack(len(hb)) + hb + compressed
+
+
+def _encode_candidate(image: Image.Image, scale: float, quality: int) -> bytes:
+    # Publicly useful convenience wrapper; encode() reuses prepared transforms.
+    return _pack_prepared(_prepare_scale(image, scale), quality)
 
 
 def encode(input_path: str, output_path: str, max_bytes: int) -> dict:
@@ -148,13 +188,17 @@ def encode(input_path: str, output_path: str, max_bytes: int) -> dict:
     best = None
     smallest_size = None
     for scale in scales:
+        # DCT is the expensive stage. Cache transformed channels per scale instead
+        # of recomputing them for every quality trial.
+        prepared = _prepare_scale(image, scale)
         for quality in qualities:
-            data = _encode_candidate(image, scale, quality)
-            smallest_size = len(data) if smallest_size is None else min(smallest_size, len(data))
-            if len(data) <= max_bytes:
-                # Keep spatial detail first, then quantization quality; this is a
-                # heuristic and should be replaced by a perceptual metric in later versions.
-                score = (round(image.width * scale) * round(image.height * scale), quality, -len(data))
+            data = _pack_prepared(prepared, quality)
+            size = len(data)
+            smallest_size = size if smallest_size is None else min(smallest_size, size)
+            if size <= max_bytes:
+                # Preserve the existing ranking for format compatibility; later
+                # versions can replace this heuristic with a perceptual objective.
+                score = (prepared["width"] * prepared["height"], quality, -size)
                 if best is None or score > best[0]:
                     best = (score, data, scale, quality)
     if best is None:
