@@ -1,5 +1,5 @@
 """
-IMAGE-LINE LSC v2: custom block-transform lossy image codec.
+IMAGE-LINE LSC v3: adaptive block quantization with cached DCT transforms.
 Pipeline: RGB -> YCbCr -> 4:2:0 chroma subsampling -> 8x8 DCT ->
 custom quantization -> zlib-compressed coefficient arrays.
 This is an educational custom format, not JPEG/WebP/AVIF.
@@ -15,8 +15,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-MAGIC = b"LSC2"
-VERSION = 2
+MAGIC = b"LSC3"
+LEGACY_MAGIC = b"LSC2"
+VERSION = 3
 HEADER_LEN = struct.Struct(">I")
 BLOCK = 8
 
@@ -80,12 +81,24 @@ def _blocks(channel: np.ndarray) -> tuple[np.ndarray, int, int]:
     return blocks.reshape(-1, 8, 8), hp, wp
 
 
-def _dct_quantize(channel: np.ndarray, table: np.ndarray) -> tuple[np.ndarray, int, int]:
+def _dct_coefficients(channel: np.ndarray) -> tuple[np.ndarray, int, int]:
+    """Transform one channel once; keep coefficients in zigzag order for reuse."""
     blocks, hp, wp = _blocks(channel.astype(np.float32) - 128.0)
     coeff = np.einsum("ij,bjk,lk->bil", _C, blocks, _C, optimize=True)
-    q = np.rint(coeff / table[None, :, :]).astype(np.int16)
-    # Zigzag per block tends to put long zero runs at the end, improving zlib.
-    return q.reshape(-1, 64)[:, ZIGZAG_FLAT].astype(">i2"), hp, wp
+    zigzag_coeff = coeff.reshape(-1, 64)[:, ZIGZAG_FLAT]
+    return zigzag_coeff.astype(np.float32), hp, wp
+
+
+def _quantize_coefficients(coeff: np.ndarray, table: np.ndarray) -> np.ndarray:
+    """Quantize cached zigzag DCT coefficients without repeating the DCT."""
+    table_flat = table.reshape(64)[ZIGZAG_FLAT]
+    return np.rint(coeff / table_flat[None, :]).astype(">i2")
+
+
+def _dct_quantize(channel: np.ndarray, table: np.ndarray) -> tuple[np.ndarray, int, int]:
+    # Compatibility helper retained for internal callers and tests.
+    coeff, hp, wp = _dct_coefficients(channel)
+    return _quantize_coefficients(coeff, table), hp, wp
 
 
 def _idct_dequantize(stream: np.ndarray, hp: int, wp: int, table: np.ndarray) -> np.ndarray:
@@ -108,32 +121,122 @@ def _idct_dequantize(stream: np.ndarray, hp: int, wp: int, table: np.ndarray) ->
     return np.clip(rows.reshape(hp, wp), 0, 255)
 
 
-def _encode_candidate(image: Image.Image, scale: float, quality: int) -> bytes:
+def _idct_dequantize_adaptive(stream: np.ndarray, hp: int, wp: int,
+                                 table: np.ndarray, factor_ids: np.ndarray) -> np.ndarray:
+    """Inverse transform with stored per-block quantization multiplier ids."""
+    stream = np.asarray(stream)
+    if stream.ndim != 2 or stream.shape[1] not in (62, 64):
+        raise ValueError("Invalid adaptive coefficient stream.")
+    if factor_ids.size != stream.shape[0] or np.any(factor_ids > 2):
+        raise ValueError("Invalid adaptive quantization factors.")
+    if stream.shape[1] == 62:
+        q_flat = np.zeros((stream.shape[0], 64), dtype=np.float32)
+        q_flat[:, LEGACY_ZIGZAG_FLAT] = stream.astype(np.float32)
+    else:
+        q_flat = stream.astype(np.float32)[:, np.argsort(ZIGZAG_FLAT)]
+    q = q_flat.reshape(-1, 8, 8)
+    multipliers = np.array([0.90, 1.00, 1.10], dtype=np.float32)[factor_ids]
+    coeff = q * table[None, :, :] * multipliers[:, None, None]
+    blocks = np.einsum("ji,bjk,kl->bil", _C, coeff, _C, optimize=True) + 128.0
+    rows = blocks.reshape(hp // 8, wp // 8, 8, 8).transpose(0, 2, 1, 3)
+    return np.clip(rows.reshape(hp, wp), 0, 255)
+
+
+def _prepare_scale(image: Image.Image, scale: float) -> dict:
+    """Resize, subsample and transform channels once for all quality trials."""
     w = max(1, round(image.width * scale))
     h = max(1, round(image.height * scale))
     scaled = image.resize((w, h), Image.Resampling.LANCZOS).convert("YCbCr")
     y, cb, cr = [np.asarray(ch, dtype=np.uint8) for ch in scaled.split()]
-    # 4:2:0 chroma subsampling: human vision is less sensitive to fine color detail.
+
+    # 4:2:0 chroma subsampling: vision is less sensitive to fine color detail.
     cw, ch = max(1, (w + 1) // 2), max(1, (h + 1) // 2)
-    cb_small = np.asarray(Image.fromarray(cb).resize((cw, ch), Image.Resampling.BOX), dtype=np.uint8)
-    cr_small = np.asarray(Image.fromarray(cr).resize((cw, ch), Image.Resampling.BOX), dtype=np.uint8)
+    cb_small = np.asarray(
+        Image.fromarray(cb).resize((cw, ch), Image.Resampling.BOX), dtype=np.uint8
+    )
+    cr_small = np.asarray(
+        Image.fromarray(cr).resize((cw, ch), Image.Resampling.BOX), dtype=np.uint8
+    )
+
+    y_coeff, yhp, ywp = _dct_coefficients(y)
+    cb_coeff, chp, cwp = _dct_coefficients(cb_small)
+    cr_coeff, _, _ = _dct_coefficients(cr_small)
+    return {
+        "width": w, "height": h,
+        "y_coeff": y_coeff, "cb_coeff": cb_coeff, "cr_coeff": cr_coeff,
+        "y_padded": [yhp, ywp], "c_padded": [chp, cwp],
+        "original_width": image.width, "original_height": image.height,
+        "scale": float(scale),
+    }
+
+
+def _activity_factors(coeff: np.ndarray) -> np.ndarray:
+    """Choose gentle per-block quantization multipliers from AC activity ranks.
+
+    Low-activity blocks receive slightly finer quantization; highly textured
+    blocks receive slightly coarser quantization. Only three levels are used,
+    so the side information is one byte per block and easy to decode.
+    """
+    if coeff.shape[0] == 0:
+        return np.empty((0,), dtype=np.uint8)
+    activity = np.mean(np.abs(coeff[:, 1:]), axis=1)
+    low, high = np.quantile(activity, [0.30, 0.70])
+    # 0 -> 0.90x, 1 -> 1.00x, 2 -> 1.10x base quantization.
+    factors = np.ones(activity.shape, dtype=np.uint8)
+    if high - low < 1e-6:
+        # Identical block activity has no meaningful ranking; use neutral steps.
+        return factors
+    factors[activity <= low] = 0
+    factors[activity >= high] = 2
+    return factors
+
+
+def _quantize_adaptive(coeff: np.ndarray, table: np.ndarray,
+                       factor_ids: np.ndarray) -> np.ndarray:
+    """Quantize zigzag DCT coefficients with one multiplier per block."""
+    table_flat = table.reshape(64)[ZIGZAG_FLAT]
+    multipliers = np.array([0.90, 1.00, 1.10], dtype=np.float32)[factor_ids]
+    adjusted = table_flat[None, :] * multipliers[:, None]
+    return np.rint(coeff / adjusted).astype(">i2")
+
+
+def _pack_prepared(prepared: dict, quality: int) -> bytes:
+    """Quantize and entropy-compress one prepared scale at a selected quality."""
     ty, tc = _quant_table(QY, quality), _quant_table(QC, quality)
-    yq, yhp, ywp = _dct_quantize(y, ty)
-    cbq, chp, cwp = _dct_quantize(cb_small, tc)
-    crq, _, _ = _dct_quantize(cr_small, tc)
-    raw = yq.tobytes() + cbq.tobytes() + crq.tobytes()
+    y_factors = _activity_factors(prepared["y_coeff"])
+    cb_factors = _activity_factors(prepared["cb_coeff"])
+    cr_factors = _activity_factors(prepared["cr_coeff"])
+    yq = _quantize_adaptive(prepared["y_coeff"], ty, y_factors)
+    cbq = _quantize_adaptive(prepared["cb_coeff"], tc, cb_factors)
+    crq = _quantize_adaptive(prepared["cr_coeff"], tc, cr_factors)
+
+    # Store one compact factor id per block after the int16 coefficient arrays.
+    raw = (
+        yq.tobytes() + cbq.tobytes() + crq.tobytes()
+        + y_factors.tobytes() + cb_factors.tobytes() + cr_factors.tobytes()
+    )
     compressed = zlib.compress(raw, level=6)
     header = {
-        "version": VERSION, "width": w, "height": h,
-        "original_width": image.width, "original_height": image.height,
-        "quality": int(quality), "scale": float(scale),
-        "y_padded": [yhp, ywp], "c_padded": [chp, cwp],
+        "version": VERSION, "width": prepared["width"], "height": prepared["height"],
+        "original_width": prepared["original_width"],
+        "original_height": prepared["original_height"],
+        "quality": int(quality), "scale": prepared["scale"],
+        "y_padded": prepared["y_padded"], "c_padded": prepared["c_padded"],
         "y_coeff_count": int(yq.size), "c_coeff_count": int(cbq.size),
+        "y_factor_count": int(y_factors.size),
+        "c_factor_count": int(cb_factors.size),
+        "adaptive_quantization": "activity-rank-v1",
         "chroma": "4:2:0", "transform": "8x8 DCT-II",
-        "quantization": "custom scalar tables", "payload": "zlib int16 zigzag"
+        "quantization": "custom scalar tables with block activity multipliers",
+        "payload": "zlib int16 zigzag + uint8 block factors"
     }
     hb = json.dumps(header, separators=(",", ":")).encode("utf-8")
     return MAGIC + HEADER_LEN.pack(len(hb)) + hb + compressed
+
+
+def _encode_candidate(image: Image.Image, scale: float, quality: int) -> bytes:
+    # Publicly useful convenience wrapper; encode() reuses prepared transforms.
+    return _pack_prepared(_prepare_scale(image, scale), quality)
 
 
 def encode(input_path: str, output_path: str, max_bytes: int) -> dict:
@@ -148,13 +251,17 @@ def encode(input_path: str, output_path: str, max_bytes: int) -> dict:
     best = None
     smallest_size = None
     for scale in scales:
+        # DCT is the expensive stage. Cache transformed channels per scale instead
+        # of recomputing them for every quality trial.
+        prepared = _prepare_scale(image, scale)
         for quality in qualities:
-            data = _encode_candidate(image, scale, quality)
-            smallest_size = len(data) if smallest_size is None else min(smallest_size, len(data))
-            if len(data) <= max_bytes:
-                # Keep spatial detail first, then quantization quality; this is a
-                # heuristic and should be replaced by a perceptual metric in later versions.
-                score = (round(image.width * scale) * round(image.height * scale), quality, -len(data))
+            data = _pack_prepared(prepared, quality)
+            size = len(data)
+            smallest_size = size if smallest_size is None else min(smallest_size, size)
+            if size <= max_bytes:
+                # Preserve the existing ranking for format compatibility; later
+                # versions can replace this heuristic with a perceptual objective.
+                score = (prepared["width"] * prepared["height"], quality, -size)
                 if best is None or score > best[0]:
                     best = (score, data, scale, quality)
     if best is None:
@@ -171,27 +278,43 @@ def encode(input_path: str, output_path: str, max_bytes: int) -> dict:
 
 def decode(input_path: str, output_path: str) -> dict:
     data = Path(input_path).read_bytes()
-    if len(data) < 8 or data[:4] != MAGIC:
-        raise ValueError("Not an LSC v2 file (expected magic LSC2).")
+    if len(data) < 8 or data[:4] not in (MAGIC, LEGACY_MAGIC):
+        raise ValueError("Not an LSC file (expected magic LSC2 or LSC3).")
     header_size = HEADER_LEN.unpack(data[4:8])[0]
     header_end = 8 + header_size
     if header_end > len(data):
         raise ValueError("Corrupt LSC header.")
     header = json.loads(data[8:header_end].decode("utf-8"))
-    if header.get("version") != VERSION:
+    file_version = int(header.get("version", 0))
+    if (data[:4] == MAGIC and file_version != VERSION) or (
+        data[:4] == LEGACY_MAGIC and file_version != 2
+    ):
         raise ValueError("Unsupported LSC version.")
     raw = zlib.decompress(data[header_end:])
     y_count, c_count = int(header["y_coeff_count"]), int(header["c_coeff_count"])
-    expected_bytes = (y_count + 2 * c_count) * 2
+    coefficient_bytes = (y_count + 2 * c_count) * 2
+    adaptive = header.get("adaptive_quantization") == "activity-rank-v1"
+    y_factor_count = int(header.get("y_factor_count", 0)) if adaptive else 0
+    c_factor_count = int(header.get("c_factor_count", 0)) if adaptive else 0
+    expected_bytes = coefficient_bytes + y_factor_count + 2 * c_factor_count
     if len(raw) != expected_bytes:
-        raise ValueError("Coefficient data size does not match the header.")
-    coeff = np.frombuffer(raw, dtype=">i2")
+        raise ValueError("Coefficient/factor data size does not match the header.")
+    coeff = np.frombuffer(raw[:coefficient_bytes], dtype=">i2")
+    if adaptive:
+        factor_data = np.frombuffer(raw[coefficient_bytes:], dtype=np.uint8)
+        y_factors = factor_data[:y_factor_count]
+        cb_factors = factor_data[y_factor_count:y_factor_count + c_factor_count]
+        cr_factors = factor_data[y_factor_count + c_factor_count:]
+    else:
+        y_factors = cb_factors = cr_factors = None
     quality = int(header["quality"])
     ty, tc = _quant_table(QY, quality), _quant_table(QC, quality)
     yhp, ywp = map(int, header["y_padded"])
     chp, cwp = map(int, header["c_padded"])
     y_blocks = (yhp // 8) * (ywp // 8)
     c_blocks = (chp // 8) * (cwp // 8)
+    if adaptive and (y_factor_count != y_blocks or c_factor_count != c_blocks):
+        raise ValueError("Adaptive factor counts do not match padded image dimensions.")
     if y_count == y_blocks * 64 and c_count == c_blocks * 64:
         coefficients_per_block = 64
     elif y_count == y_blocks * 62 and c_count == c_blocks * 62:
@@ -201,10 +324,18 @@ def decode(input_path: str, output_path: str) -> dict:
     yq = coeff[:y_count].reshape(y_blocks, coefficients_per_block)
     cbq = coeff[y_count:y_count + c_count].reshape(c_blocks, coefficients_per_block)
     crq = coeff[y_count + c_count:].reshape(c_blocks, coefficients_per_block)
-    y = _idct_dequantize(yq, yhp, ywp, ty)[:int(header["height"]), :int(header["width"])]
+    if adaptive:
+        y = _idct_dequantize_adaptive(yq, yhp, ywp, ty, y_factors)
+        cb = _idct_dequantize_adaptive(cbq, chp, cwp, tc, cb_factors)
+        cr = _idct_dequantize_adaptive(crq, chp, cwp, tc, cr_factors)
+    else:
+        y = _idct_dequantize(yq, yhp, ywp, ty)
+        cb = _idct_dequantize(cbq, chp, cwp, tc)
+        cr = _idct_dequantize(crq, chp, cwp, tc)
+    y = y[:int(header["height"]), :int(header["width"])]
     cw, ch = max(1, (int(header["width"]) + 1) // 2), max(1, (int(header["height"]) + 1) // 2)
-    cb = _idct_dequantize(cbq, chp, cwp, tc)[:ch, :cw]
-    cr = _idct_dequantize(crq, chp, cwp, tc)[:ch, :cw]
+    cb = cb[:ch, :cw]
+    cr = cr[:ch, :cw]
     cb_img = Image.fromarray(np.uint8(np.clip(cb, 0, 255))).resize((int(header["width"]), int(header["height"])), Image.Resampling.BILINEAR)
     cr_img = Image.fromarray(np.uint8(np.clip(cr, 0, 255))).resize((int(header["width"]), int(header["height"])), Image.Resampling.BILINEAR)
     y_img = Image.fromarray(np.uint8(np.clip(y, 0, 255)))
@@ -217,7 +348,7 @@ def decode(input_path: str, output_path: str) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="IMAGE-LINE custom LSC v2 lossy codec")
+    parser = argparse.ArgumentParser(description="IMAGE-LINE custom LSC v3 lossy codec")
     sub = parser.add_subparsers(dest="command", required=True)
     enc = sub.add_parser("encode", help="Encode an image into .lsc")
     enc.add_argument("input")
