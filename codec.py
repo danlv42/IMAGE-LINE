@@ -183,6 +183,9 @@ def _activity_factors(coeff: np.ndarray) -> np.ndarray:
     low, high = np.quantile(activity, [0.30, 0.70])
     # 0 -> 0.90x, 1 -> 1.00x, 2 -> 1.10x base quantization.
     factors = np.ones(activity.shape, dtype=np.uint8)
+    if high - low < 1e-6:
+        # Identical block activity has no meaningful ranking; use neutral steps.
+        return factors
     factors[activity <= low] = 0
     factors[activity >= high] = 2
     return factors
@@ -310,6 +313,8 @@ def decode(input_path: str, output_path: str) -> dict:
     chp, cwp = map(int, header["c_padded"])
     y_blocks = (yhp // 8) * (ywp // 8)
     c_blocks = (chp // 8) * (cwp // 8)
+    if adaptive and (y_factor_count != y_blocks or c_factor_count != c_blocks):
+        raise ValueError("Adaptive factor counts do not match padded image dimensions.")
     if y_count == y_blocks * 64 and c_count == c_blocks * 64:
         coefficients_per_block = 64
     elif y_count == y_blocks * 62 and c_count == c_blocks * 62:
