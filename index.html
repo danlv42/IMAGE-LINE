@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>IMAGE-LINE — LSC</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
+    body { margin:0; min-height:100vh; background:#101116; color:#f4f4f5; }
+    main { max-width:1000px; margin:0 auto; padding:36px 20px; }
+    h1 { margin:0 0 8px; font-size:clamp(28px,5vw,42px); }
+    p { color:#a1a1aa; line-height:1.55; }
+    .panel { margin-top:24px; padding:22px; border:1px solid #30303a; border-radius:18px; background:#191a22; }
+    label { display:block; margin:14px 0 8px; color:#d4d4d8; }
+    input,button { font:inherit; }
+    input[type=file],input[type=number] { box-sizing:border-box; width:100%; padding:12px; border:1px solid #3f3f4a; border-radius:10px; background:#111218; color:#fff; }
+    button { margin-top:18px; border:0; border-radius:10px; padding:12px 18px; background:#c4b5fd; color:#171326; font-weight:700; cursor:pointer; }
+    button:disabled { opacity:.55; cursor:wait; }
+    .compare { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-top:20px; }
+    figure { margin:0; min-width:0; } figcaption { margin-bottom:8px; color:#d4d4d8; }
+    img { width:100%; height:auto; display:block; border-radius:10px; background:#09090b; }
+    .meta { margin-top:16px; color:#c4b5fd; white-space:pre-wrap; }
+    a { color:#c4b5fd; }
+    #status { min-height:24px; color:#fca5a5; }
+    @media(max-width:650px) { .compare { grid-template-columns:1fr; } main {padding:24px 14px;} }
+  </style>
+</head>
+<body>
+<main>
+  <h1>IMAGE-LINE <span style="color:#c4b5fd">LSC</span></h1>
+  <p>Собственный lossy-кодек изображений. Задайте предельный размер, закодируйте изображение и сравните восстановленную версию с оригиналом.</p>
+  <section class="panel">
+    <form id="encodeForm">
+      <label for="image">Исходное изображение</label>
+      <input id="image" name="file" type="file" accept="image/*" required>
+      <label for="limit">Максимальный размер, КБ</label>
+      <input id="limit" name="max_kb" type="number" min="1" value="200" required>
+      <button id="submit" type="submit">Сжать изображение</button>
+      <div id="status" role="status"></div>
+    </form>
+    <div class="compare" id="compare" hidden>
+      <figure><figcaption>Оригинал</figcaption><img id="original" alt="Оригинальное изображение"></figure>
+      <figure><figcaption>Восстановленное LSC</figcaption><img id="restored" alt="Изображение после декодирования"></figure>
+    </div>
+    <div class="meta" id="meta"></div>
+  </section>
+</main>
+<script>
+const form = document.querySelector("#encodeForm");
+const button = document.querySelector("#submit");
+const statusEl = document.querySelector("#status");
+const meta = document.querySelector("#meta");
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const image = document.querySelector("#image").files[0];
+  const maxKb = Number(document.querySelector("#limit").value);
+  if (!image || !Number.isInteger(maxKb) || maxKb < 1) return;
+  const body = new FormData();
+  body.append("file", image);
+  body.append("max_kb", String(maxKb));
+  button.disabled = true;
+  statusEl.textContent = "Кодирование…";
+  meta.textContent = "";
+  try {
+    const response = await fetch("/encode", { method:"POST", body });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || "Не удалось закодировать изображение");
+    document.querySelector("#original").src = URL.createObjectURL(image);
+    document.querySelector("#restored").src = result.preview_url;
+    document.querySelector("#compare").hidden = false;
+    meta.textContent = "Размер: " + result.size_bytes.toLocaleString("ru-RU") +
+      " / " + result.limit_bytes.toLocaleString("ru-RU") + " байт\n" +
+      "Коэффициент сжатия: " + result.compression_ratio + "×\n" +
+      "Масштаб: " + result.scale + " · quality: " + result.quality + "\n" +
+      "Скачать LSC: " + location.origin + result.download_url;
+    statusEl.textContent = "Готово";
+  } catch (error) {
+    statusEl.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
