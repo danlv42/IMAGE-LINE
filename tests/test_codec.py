@@ -23,6 +23,18 @@ class CodecRegressionTests(unittest.TestCase):
         self.assertEqual((direct_h, direct_w), (cached_h, cached_w))
         np.testing.assert_array_equal(direct, cached)
 
+    def test_adaptive_factor_selection_has_three_documented_levels(self):
+        rng = np.random.default_rng(12)
+        blocks = rng.normal(0, 1, size=(20, 64)).astype(np.float32)
+        blocks[:, 0] = 0
+        factors = codec._activity_factors(blocks)
+
+        self.assertEqual(factors.shape, (20,))
+        self.assertTrue(set(np.unique(factors)).issubset({0, 1, 2}))
+
+        uniform = np.zeros((5, 64), dtype=np.float32)
+        np.testing.assert_array_equal(codec._activity_factors(uniform), np.ones(5, dtype=np.uint8))
+
     def test_encode_decode_round_trip_and_size_limit(self):
         # Smooth gradients are deterministic and compress well enough for a
         # small test cap, without requiring fixture files in the repository.
